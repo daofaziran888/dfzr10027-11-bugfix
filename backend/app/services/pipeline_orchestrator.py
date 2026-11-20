@@ -5,9 +5,8 @@
 """
 from __future__ import annotations
 
-import math
 import statistics
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from app.fixtures import (
@@ -15,11 +14,11 @@ from app.fixtures import (
     COHORT_USERS,
     DATA_MART_ROWS,
     DIMENSIONS,
-    EXPERIMENT_RESULTS,
     METRIC_DEFS,
     QUALITY_CHECK_SAMPLES,
     TREND_POINTS,
 )
+from app.services import experiment_stats
 from app.store import store
 
 # ---------------------------------------------------------------------------
@@ -274,61 +273,21 @@ def run_cohort_extract_pipeline(rule: dict[str, Any] | None = None) -> dict[str,
 # Pipeline 5: experiment -> stat_model -> data_mart
 # ---------------------------------------------------------------------------
 
-def run_experiment_stat_pipeline(experiment_code: str | None = None) -> dict[str, Any]:
-    """读取实验 fixtures，执行双比例 z 检验与效应量计算，产物写入数据集市。"""
-    rows = list(EXPERIMENT_RESULTS)
+def run_experiment_stat_pipeline(
+    experiment_code: str | None = None,
+    version: int | None = None,
+) -> dict[str, Any]:
+    """按实验配置的显著性水平执行双比例 z 检验，带门槛的摘要写入数据集市。
+
+    统计口径（观测版本、显著性水平校验、摘要冻结）统一由
+    app.services.experiment_stats 承载，这里只负责管道产物落账。
+    """
     if experiment_code is None:
         experiment_code = "EXPE-001"
 
-    exp_rows = [r for r in rows if r.get("实验编号") == experiment_code]
-    if len(exp_rows) < 2:
-        return {"error": "实验数据不足"}
-
-    control = next((r for r in exp_rows if r.get("分组") == "control"), None)
-    treatment = next((r for r in exp_rows if r.get("分组") == "treatment"), None)
-    if control is None or treatment is None:
-        return {"error": "缺少对照组或实验组"}
-
-    n_c = _to_int(control.get("样本量"))
-    n_t = _to_int(treatment.get("样本量"))
-    conv_c = _to_int(control.get("转化人数"))
-    conv_t = _to_int(treatment.get("转化人数"))
-
-    p_c = conv_c / n_c if n_c else 0.0
-    p_t = conv_t / n_t if n_t else 0.0
-    p_pool = (conv_c + conv_t) / (n_c + n_t) if (n_c + n_t) else 0.0
-    se = math.sqrt(p_pool * (1 - p_pool) * (1 / n_c + 1 / n_t)) if (n_c + n_t) else 0.0
-    z = (p_t - p_c) / se if se else 0.0
-
-    # Cohen's h 效应量
-    cohen_h = 2 * (math.asin(math.sqrt(p_t)) - math.asin(math.sqrt(p_c))) if (p_t >= 0 and p_c >= 0) else 0.0
-
-    result = {
-        "experiment_code": experiment_code,
-        "control_rate": round(p_c, 4),
-        "treatment_rate": round(p_t, 4),
-        "absolute_lift": round(p_t - p_c, 4),
-        "relative_lift": round((p_t - p_c) / p_c, 4) if p_c else None,
-        "z_score": round(z, 4),
-        "cohen_h": round(cohen_h, 4),
-        "significant_at_05": abs(z) > 1.96,
-        "sample_size_control": n_c,
-        "sample_size_treatment": n_t,
-    }
-
-    # 同时写入 data_mart 可消费的统计摘要行
-    mart_entry = {
-        "主题编号": f"DATA-STAT-{experiment_code}",
-        "region": "all",
-        "channel": "all",
-        "日期": str(date.today()),
-        "实验编号": experiment_code,
-        "控制组转化率": result["control_rate"],
-        "实验组转化率": result["treatment_rate"],
-        "相对提升": result["relative_lift"],
-        "显著性": result["significant_at_05"],
-    }
-    store.rows("data_mart").append(mart_entry)
+    result = experiment_stats.run_experiment_stat(experiment_code, version)
+    if "error" in result:
+        return result
 
     _write_result("experiment_stat_mart", {
         "source_modules": ["experiment", "stat_model"],

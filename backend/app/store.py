@@ -11,7 +11,13 @@ from app.seed import SEED_ROWS
 
 class Store:
     def __init__(self) -> None:
-        self._tables: dict[str, list[dict[str, Any]]] = {
+        self._tables: dict[str, list[dict[str, Any]]] = {}
+        self.reset()
+
+    def reset(self) -> None:
+        """原地重建全部表：各模块以 `from app.store import store` 持有同一实例，
+        只有就地替换表内容才能真正实现测试隔离。"""
+        self._tables = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
         self._tables.setdefault("_pipeline_results", [])
@@ -52,5 +58,4 @@ store = Store()
 
 def reset_store() -> None:
     """重新初始化全局 store，用于测试隔离。"""
-    global store
-    store = Store()
+    store.reset()

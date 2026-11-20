@@ -3,6 +3,15 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
+from app.services.experiment import ExperimentService
+from app.services.experiment_stats import (
+    get_published_summary,
+    list_observations,
+    mart_experiment_report,
+    record_observation,
+)
 from app.services.pipeline_orchestrator import (
     list_pipeline_results,
     run_all_pipelines,
@@ -130,8 +139,11 @@ class TestExperimentStatPipeline:
         assert result["experiment_code"] == "EXPE-001"
         # treatment 412/5000 = 0.0824, control 350/5000 = 0.07 -> lift positive
         assert result["absolute_lift"] > 0
-        assert result["significant_at_05"] is True
-        assert abs(result["z_score"]) > 1.96
+        # 种子实验配置显著性水平 0.05，门槛应取自配置而不是固定 1.96
+        assert result["alpha"] == 0.05
+        assert result["z_critical"] == pytest.approx(1.96, abs=1e-4)
+        assert result["significant"] is True
+        assert abs(result["z_score"]) > result["z_critical"]
 
     def test_expe002_effect_size(self):
         result = run_experiment_stat_pipeline("EXPE-002")
@@ -146,12 +158,186 @@ class TestExperimentStatPipeline:
         assert after == before + 1
         last = store.rows("data_mart")[-1]
         assert last.get("实验编号") == "EXPE-001"
+        # 集市快照必须带实际门槛与观测版本，供报表详情复查
+        assert last.get("显著性水平") == 0.05
+        assert last.get("临界值") == pytest.approx(1.96, abs=1e-4)
+        assert last.get("观测版本") == 1
+        assert last.get("显著性") is True
 
     def test_pipeline_result_written(self):
         run_experiment_stat_pipeline("EXPE-001")
         results = list_pipeline_results()
         ids = [r["pipeline_id"] for r in results]
         assert "experiment_stat_mart" in ids
+
+
+class TestExperimentStatAcceptance:
+    """验收场景：实验配置 1% 显著性水平，日报生成期间补报转化人数。"""
+
+    CODE = "EXPE-901"
+
+    def _register(self, code: str, alpha: str) -> None:
+        entry, missing = ExperimentService().create_entry({
+            "实验编号": code,
+            "实验假设": "新结算页可提升支付转化率",
+            "分组方案": "control:treatment=1:1",
+            "显著性水平": alpha,
+        })
+        assert not missing
+
+    def _setup_v1(self) -> None:
+        """配置 1% 显著性水平，登记第 1 版观测：对照 1000/100，实验 1000/132。"""
+        self._register(self.CODE, "0.01")
+        obs, _ = record_observation(self.CODE, [
+            {"分组": "control", "样本量": 1000, "转化人数": 100},
+            {"分组": "treatment", "样本量": 1000, "转化人数": 132},
+        ], source="日报初版")
+        assert obs is not None and obs["观测版本"] == 1
+
+    def _correct_to_145(self) -> None:
+        """日报生成期间补报：实验组改报 145 人，登记为第 2 版观测。"""
+        obs, _ = record_observation(self.CODE, [
+            {"分组": "control", "样本量": 1000, "转化人数": 100},
+            {"分组": "treatment", "样本量": 1000, "转化人数": 145},
+        ], source="补报更正")
+        assert obs is not None and obs["观测版本"] == 2
+
+    def test_not_significant_at_1pct_on_api_and_mart(self):
+        self._setup_v1()
+        # 统计入口：z≈2.2345，门槛 2.5758，不显著
+        result = run_experiment_stat_pipeline(self.CODE)
+        assert result["alpha"] == 0.01
+        assert result["z_critical"] == pytest.approx(2.5758, abs=1e-4)
+        assert result["z_critical"] != pytest.approx(1.96, abs=1e-4)
+        assert result["significant"] is False
+        assert result["conclusion"] == "不显著"
+        # 集市报表详情：同一统计输出，同样不显著
+        report, message = mart_experiment_report(self.CODE)
+        assert report is not None, message
+        assert report["significant"] is False
+        assert report["z_critical"] == result["z_critical"]
+        assert report["z_score"] == result["z_score"]
+        assert report["sample_size_control"] == 1000
+        assert report["conversions_control"] == 100
+        assert report["sample_size_treatment"] == 1000
+        assert report["conversions_treatment"] == 132
+        # 集市快照行带实际门槛与观测版本
+        mart_rows = [r for r in store.rows("data_mart") if r.get("实验编号") == self.CODE]
+        assert len(mart_rows) == 1
+        assert mart_rows[0]["显著性"] is False
+        assert mart_rows[0]["显著性水平"] == 0.01
+        assert mart_rows[0]["临界值"] == pytest.approx(2.5758, abs=1e-4)
+        assert mart_rows[0]["观测版本"] == 1
+
+    def test_correction_then_reopen_report(self):
+        self._setup_v1()
+        first = run_experiment_stat_pipeline(self.CODE)
+        assert first["significant"] is False
+        self._correct_to_145()
+        # 再次打开报告：报表引用第 2 版的样本数、门槛和结论
+        reopened = run_experiment_stat_pipeline(self.CODE)
+        assert reopened["observation_version"] == 2
+        assert reopened["observation_source"] == "补报更正"
+        assert reopened["sample_size_control"] == 1000
+        assert reopened["sample_size_treatment"] == 1000
+        assert reopened["conversions_control"] == 100
+        assert reopened["conversions_treatment"] == 145
+        assert reopened["z_critical"] == pytest.approx(2.5758, abs=1e-4)
+        assert reopened["significant"] is True
+        assert reopened["conclusion"] == "显著"
+        # 集市报表详情与统计入口一致
+        report, _ = mart_experiment_report(self.CODE)
+        assert report["observation_version"] == 2
+        assert report["conversions_treatment"] == 145
+        assert report["z_critical"] == reopened["z_critical"]
+        assert report["significant"] is True
+
+    def test_history_query_reproduces_version_conclusion(self):
+        self._setup_v1()
+        run_experiment_stat_pipeline(self.CODE)
+        self._correct_to_145()
+        run_experiment_stat_pipeline(self.CODE)
+        # 历史查询第 1 版：重现当时的不显著结论与当时的样本
+        v1, message = mart_experiment_report(self.CODE, version=1)
+        assert v1 is not None, message
+        assert v1["observation_version"] == 1
+        assert v1["conversions_treatment"] == 132
+        assert v1["significant"] is False
+        assert v1["z_critical"] == pytest.approx(2.5758, abs=1e-4)
+        # 经营方可列出全部观测版本，区分报表采用的是哪一版
+        versions = list_observations(self.CODE)
+        assert [obs["观测版本"] for obs in versions] == [1, 2]
+
+    def test_invalid_alpha_never_falls_back_to_5pct(self):
+        # 无法解析的水平
+        self._register("EXPE-902", "abc")
+        record_observation("EXPE-902", [
+            {"分组": "control", "样本量": 1000, "转化人数": 100},
+            {"分组": "treatment", "样本量": 1000, "转化人数": 132},
+        ])
+        result = run_experiment_stat_pipeline("EXPE-902")
+        assert "error" in result
+        assert "显著性水平" in result["error"]
+        # 不发结论、不写集市、不留摘要
+        assert get_published_summary("EXPE-902") is None
+        assert not [r for r in store.rows("data_mart") if r.get("实验编号") == "EXPE-902"]
+        # 超出 (0, 1) 区间的水平同样报错
+        self._register("EXPE-903", "1.5")
+        record_observation("EXPE-903", [
+            {"分组": "control", "样本量": 1000, "转化人数": 100},
+            {"分组": "treatment", "样本量": 1000, "转化人数": 132},
+        ])
+        assert "error" in run_experiment_stat_pipeline("EXPE-903")
+        # 未登记显著性水平的实验也不能发结论
+        record_observation("EXPE-904", [
+            {"分组": "control", "样本量": 1000, "转化人数": 100},
+            {"分组": "treatment", "样本量": 1000, "转化人数": 132},
+        ])
+        assert "error" in run_experiment_stat_pipeline("EXPE-904")
+
+    def test_published_version_not_reinterpreted_by_new_threshold(self):
+        # 按 5% 发布第 1 版：z≈2.2345 > 1.96，显著
+        self._register("EXPE-905", "0.05")
+        record_observation("EXPE-905", [
+            {"分组": "control", "样本量": 1000, "转化人数": 100},
+            {"分组": "treatment", "样本量": 1000, "转化人数": 132},
+        ])
+        first = run_experiment_stat_pipeline("EXPE-905")
+        assert first["alpha"] == 0.05
+        assert first["significant"] is True
+        # 经营方把显著性水平改为 1%（同编号重新登记，以最新配置为准）
+        self._register("EXPE-905", "0.01")
+        again = run_experiment_stat_pipeline("EXPE-905")
+        # 已发布的旧版本保持原门槛原结论，不被新门槛重新解释
+        assert again["reused_published"] is True
+        assert again["alpha"] == 0.05
+        assert again["z_critical"] == pytest.approx(1.96, abs=1e-4)
+        assert again["significant"] is True
+        v1, _ = mart_experiment_report("EXPE-905", version=1)
+        assert v1["alpha"] == 0.05
+        assert v1["significant"] is True
+
+    def test_groups_must_come_from_same_valid_observation(self):
+        # 只提交实验组：不是一次有效观测，拒绝登记
+        obs, message = record_observation("EXPE-906", [
+            {"分组": "treatment", "样本量": 1000, "转化人数": 145},
+        ])
+        assert obs is None
+        assert "同一次有效观测" in message
+        # 转化人数超过样本量：无效观测，拒绝登记
+        obs, message = record_observation("EXPE-906", [
+            {"分组": "control", "样本量": 1000, "转化人数": 100},
+            {"分组": "treatment", "样本量": 1000, "转化人数": 1200},
+        ])
+        assert obs is None
+        assert "转化人数不能超过样本量" in message
+        # 两组齐全且自洽：接受为同一版观测
+        obs, _ = record_observation("EXPE-906", [
+            {"分组": "control", "样本量": 1000, "转化人数": 100},
+            {"分组": "treatment", "样本量": 1000, "转化人数": 145},
+        ])
+        assert obs is not None and obs["观测版本"] == 1
+        assert list_observations("EXPE-906")[0]["groups"][0]["样本量"] == 1000
 
 
 class TestQualityScanPipeline:

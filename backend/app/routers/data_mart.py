@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.services import experiment_stats
 from app.services.data_mart import DataMartService
 
 router = APIRouter(prefix="/api/data_mart", tags=["数据集市"])
@@ -63,6 +64,21 @@ def export_entries(
     return StreamingResponse(
         iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="data_mart.csv"'})
+
+
+@router.get("/experiment-report/{experiment_code}", response_model=ActionResult)
+def get_experiment_report(
+    experiment_code: str,
+    version: int | None = Query(default=None, description="观测版本，缺省取最新已发布"),
+) -> ActionResult:
+    """集市报表详情：读取产生显著性结果的样本与显著性水平，向报表提供与统计入口一致的输出。
+
+    必须声明在 /{entry_id} 之前；历史查询带 version 可重现当时的显著结论。
+    """
+    summary, message = experiment_stats.mart_experiment_report(experiment_code, version)
+    if summary is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message="集市实验报表详情", entry=summary)
 
 
 @router.get("/{entry_id}", response_model=dict)

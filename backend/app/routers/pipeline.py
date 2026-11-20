@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query
 
 from app.schemas import ActionResult
+from app.services import experiment_stats
 from app.services.pipeline_orchestrator import (
     list_pipeline_results,
     run_all_pipelines,
@@ -63,9 +64,50 @@ def trigger_cohort_extract() -> ActionResult:
 @router.post("/experiment-stat", response_model=ActionResult)
 def trigger_experiment_stat(
     experiment_code: str | None = Query(default=None, description="实验编号"),
+    version: int | None = Query(default=None, description="观测版本，缺省取最新一版"),
 ) -> ActionResult:
-    result = run_experiment_stat_pipeline(experiment_code)
+    """统计入口：按实验配置的显著性水平计算双比例检验；水平无效时明确报错而不是默默按 5% 发结论。"""
+    result = run_experiment_stat_pipeline(experiment_code, version)
+    if "error" in result:
+        return ActionResult(ok=False, message=result["error"], entry=result)
+    if result.get("reused_published"):
+        return ActionResult(
+            ok=True,
+            message=f"实验统计第 {result['observation_version']} 版摘要已发布，按原门槛原结论返回",
+            entry=result,
+        )
     return ActionResult(ok=True, message="实验统计管道已执行", entry=result)
+
+
+@router.post("/experiment-observation", response_model=ActionResult)
+def record_experiment_observation(payload: dict[str, object]) -> ActionResult:
+    """登记实验观测版本（如日报生成期间的补报）；两组样本量与转化人数必须同批提交。"""
+    code = str(payload.get("实验编号") or payload.get("experiment_code") or "").strip()
+    groups = payload.get("groups") or payload.get("分组数据")
+    source = str(payload.get("来源") or payload.get("source") or "补报更正")
+    entry, message = experiment_stats.record_observation(code, groups, source)
+    if entry is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry)
+
+
+@router.get("/experiment-stat/{experiment_code}", response_model=ActionResult)
+def get_experiment_stat(
+    experiment_code: str,
+    version: int | None = Query(default=None, description="观测版本，缺省取最新已发布"),
+) -> ActionResult:
+    """复查已发布的实验统计摘要；指定版本可重现当时的显著性结论。"""
+    summary = experiment_stats.get_published_summary(experiment_code, version)
+    if summary is None:
+        scope = f"第 {version} 版观测的" if version is not None else "任何"
+        return ActionResult(ok=False, message=f"实验 {experiment_code} 尚未发布{scope}统计摘要")
+    return ActionResult(ok=True, message="实验统计摘要", entry=summary)
+
+
+@router.get("/experiment-observations/{experiment_code}")
+def list_experiment_observations(experiment_code: str) -> dict[str, object]:
+    """列出实验的全部观测版本，用于区分报表采用的是哪一版数据。"""
+    return {"items": experiment_stats.list_observations(experiment_code)}
 
 
 @router.post("/quality-scan", response_model=ActionResult)
